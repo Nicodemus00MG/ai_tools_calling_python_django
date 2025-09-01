@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@ai-sdk/openai": "^2.0.23",
+    "ai": "^5.0.29",
+    "lucide-react": "^0.542.0",
+    "zod": "^4.1.5"
+  }
+}
