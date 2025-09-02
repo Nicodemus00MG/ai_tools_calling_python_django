@@ -1,206 +1,85 @@
-import { openai } from '@ai-sdk/openai';
-import { streamText, tool } from 'ai';
-import { z } from 'zod';
+import { streamText } from 'ai'; // ← Cambia a streamText
+import { google } from '@ai-sdk/google';
 
-const DJANGO_API_URL = process.env.NEXT_PUBLIC_DJANGO_API_URL;
+const DJANGO_API_URL = 'http://127.0.0.1:8000/api';
+
+async function fetchFromDjango(endpoint: string) {
+  try {
+    const response = await fetch(`${DJANGO_API_URL}${endpoint}`, {
+      cache: 'no-store'
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    return await response.json();
+  } catch (error) {
+    console.error(`Error fetching ${endpoint}:`, error);
+    return null;
+  }
+}
 
 export async function POST(req: Request) {
   try {
     const { messages } = await req.json();
+    const ultimoMensaje = messages[messages.length - 1]?.content || '';
+    let datosReales = '';
 
-    const result = await streamText({
-      model: openai('gpt-4o'),
+    // CONSULTAR CLIENTES por nombre
+    if (ultimoMensaje.includes('maría') || ultimoMensaje.includes('María') || ultimoMensaje.includes('garcía') || ultimoMensaje.includes('García')) {
+      const clientesData = await fetchFromDjango('/clientes/');
+      if (clientesData && clientesData.results) {
+        const maria = clientesData.results.find((cliente: any) => 
+          cliente.nombre.toLowerCase().includes('maría') || cliente.nombre.toLowerCase().includes('garcía')
+        );
+        
+        if (maria) {
+          datosReales = `CLIENTE: ${maria.nombre}, EMAIL: ${maria.email}, TELÉFONO: ${maria.telefono}, SALDO: ${maria.saldo_formateado}, ÚLTIMO PAGO: ${maria.ultimo_pago?.monto || 'N/A'} (${maria.ultimo_pago?.descripcion || 'Sin pagos'})`;
+        } else {
+          datosReales = 'Cliente María García no encontrado en el sistema';
+        }
+      } else {
+        datosReales = 'Error al conectar con la base de datos de clientes';
+      }
+    }
+
+    // CONSULTAR SALDO de cualquier cliente
+    else if (ultimoMensaje.includes('saldo')) {
+      const clientesData = await fetchFromDjango('/clientes/');
+      if (clientesData && clientesData.results) {
+        const clientesInfo = clientesData.results.map((cliente: any) => 
+          `${cliente.nombre}: ${cliente.saldo_formateado}`
+        ).join('; ');
+        datosReales = `SALDOS ACTUALES: ${clientesInfo}`;
+      } else {
+        datosReales = 'No se pudieron obtener los saldos';
+      }
+    }
+
+    // Si no hay datos específicos, usar mensaje genérico
+    if (!datosReales) {
+      datosReales = 'Sistema de gestión de clientes conectado. Puedo consultar saldos, tickets y pagos.';
+    }
+
+    const gemini = google('gemini-1.5-flash');
+
+    // USAR streamText EN LUGAR DE generateText
+    const result = streamText({
+      model: gemini,
+      system: `Eres un asistente de soporte técnico conectado al sistema Django.
+               DATOS REALES DEL SISTEMA: ${datosReales}
+               Responde de manera profesional y útil en español.`,
       messages,
-      tools: {
-        buscarCliente: tool({
-          description: 'Buscar cliente en el sistema por nombre o email',
-          parameters: z.object({
-            query: z.string().describe('Nombre o email del cliente a buscar'),
-          }),
-          execute: async ({ query }) => {
-            try {
-              const response = await fetch(
-                `${DJANGO_API_URL}/tools/buscar-cliente/?q=${encodeURIComponent(query)}`
-              );
-              
-              if (!response.ok) {
-                throw new Error(`Error ${response.status}: ${response.statusText}`);
-              }
-              
-              const data = await response.json();
-              return {
-                success: true,
-                message: data.message || 'Búsqueda completada',
-                clientes: data.clientes || [],
-                total: data.total || 0
-              };
-            } catch (error) {
-              console.error('Error en buscarCliente:', error);
-              return {
-                success: false,
-                error: 'No se pudo conectar con el sistema de clientes',
-                message: error instanceof Error ? error.message : 'Error desconocido'
-              };
-            }
-          },
-        }),
-
-        consultarSaldo: tool({
-          description: 'Consultar el saldo actual de un cliente por su ID',
-          parameters: z.object({
-            clienteId: z.number().describe('ID numérico del cliente'),
-          }),
-          execute: async ({ clienteId }) => {
-            try {
-              const response = await fetch(
-                `${DJANGO_API_URL}/tools/cliente/${clienteId}/saldo/`
-              );
-              
-              if (!response.ok) {
-                if (response.status === 404) {
-                  return {
-                    success: false,
-                    error: 'Cliente no encontrado',
-                    message: `No existe cliente con ID ${clienteId}`
-                  };
-                }
-                throw new Error(`Error ${response.status}: ${response.statusText}`);
-              }
-              
-              const data = await response.json();
-              return {
-                success: true,
-                cliente: data.cliente,
-                ultimos_pagos: data.ultimos_pagos || [],
-                resumen: data.resumen || {}
-              };
-            } catch (error) {
-              console.error('Error en consultarSaldo:', error);
-              return {
-                success: false,
-                error: 'No se pudo consultar el saldo',
-                message: error instanceof Error ? error.message : 'Error desconocido'
-              };
-            }
-          },
-        }),
-
-        crearTicket: tool({
-          description: 'Crear un nuevo ticket de soporte para un cliente',
-          parameters: z.object({
-            clienteId: z.number().describe('ID del cliente'),
-            titulo: z.string().describe('Título del problema'),
-            descripcion: z.string().describe('Descripción detallada del problema'),
-            prioridad: z.enum(['baja', 'media', 'alta', 'critica']).optional().describe('Prioridad del ticket'),
-          }),
-          execute: async ({ clienteId, titulo, descripcion, prioridad = 'media' }) => {
-            try {
-              const response = await fetch(`${DJANGO_API_URL}/tools/crear-ticket/`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  cliente: clienteId,
-                  titulo,
-                  descripcion,
-                  prioridad,
-                }),
-              });
-              
-              if (!response.ok) {
-                const errorData = await response.json().catch(() => null);
-                return {
-                  success: false,
-                  error: errorData?.error || 'Error al crear ticket',
-                  message: errorData?.message || `Error ${response.status}`
-                };
-              }
-              
-              const data = await response.json();
-              return {
-                success: true,
-                mensaje: data.mensaje,
-                ticket: data.ticket,
-                instrucciones: data.instrucciones
-              };
-            } catch (error) {
-              console.error('Error en crearTicket:', error);
-              return {
-                success: false,
-                error: 'No se pudo crear el ticket',
-                message: error instanceof Error ? error.message : 'Error desconocido'
-              };
-            }
-          },
-        }),
-
-        registrarPago: tool({
-          description: 'Registrar un pago de cliente y actualizar su saldo',
-          parameters: z.object({
-            clienteId: z.number().describe('ID del cliente que realiza el pago'),
-            monto: z.number().positive().describe('Monto del pago (debe ser positivo)'),
-            descripcion: z.string().optional().describe('Descripción o concepto del pago'),
-            metodoPago: z.enum(['efectivo', 'tarjeta', 'transferencia', 'cheque']).optional().describe('Método de pago'),
-          }),
-          execute: async ({ clienteId, monto, descripcion = 'Pago registrado', metodoPago = 'transferencia' }) => {
-            try {
-              const response = await fetch(`${DJANGO_API_URL}/tools/registrar-pago/`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  cliente: clienteId,
-                  monto,
-                  descripcion,
-                  metodo_pago: metodoPago,
-                }),
-              });
-              
-              if (!response.ok) {
-                const errorData = await response.json().catch(() => null);
-                return {
-                  success: false,
-                  error: errorData?.error || 'Error al registrar pago',
-                  message: errorData?.message || `Error ${response.status}`
-                };
-              }
-              
-              const data = await response.json();
-              return {
-                success: true,
-                mensaje: data.mensaje,
-                pago: data.pago,
-                saldos: data.saldos,
-                confirmacion: data.confirmacion
-              };
-            } catch (error) {
-              console.error('Error en registrarPago:', error);
-              return {
-                success: false,
-                error: 'No se pudo registrar el pago',
-                message: error instanceof Error ? error.message : 'Error desconocido'
-              };
-            }
-          },
-        }),
-      },
-      maxTokens: 1000,
-      temperature: 0.3,
     });
 
-    // Usar toDataStreamResponse() en lugar de toAIStreamResponse()
     return result.toDataStreamResponse();
-    
+
   } catch (error) {
-    console.error('Error en POST /api/chat:', error);
-    
+    console.error('Error en API chat:', error);
     return new Response(
-      JSON.stringify({
-        error: 'Error interno del servidor',
-        message: error instanceof Error ? error.message : 'Error desconocido'
-      }),
-      {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      }
+      JSON.stringify({ error: 'Error interno del servidor' }), 
+      { status: 500 }
     );
   }
 }
